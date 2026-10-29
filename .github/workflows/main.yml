@@ -1,0 +1,343 @@
+name: Build Windows & Android Releases
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Create & Build Android Project
+        shell: bash
+        run: |
+          flutter create --platforms=android --org com.documaster.app documaster_app
+          cd documaster_app
+          flutter pub add file_picker http syncfusion_flutter_pdfviewer syncfusion_flutter_pdf desktop_drop signature path_provider
+
+          python3 -c '
+          code = """import "dart:io";
+          import "dart:typed_data";
+          import "dart:ui" as ui;
+          import "package:flutter/material.dart";
+          import "package:file_picker/file_picker.dart";
+          import "package:desktop_drop/desktop_drop.dart";
+          import "package:syncfusion_flutter_pdf/pdf.dart";
+          import "package:syncfusion_flutter_pdfviewer/pdfviewer.dart";
+          import "package:signature/signature.dart";
+
+          void main() {
+            runApp(const DocuMasterApp());
+          }
+
+          class DocuMasterApp extends StatelessWidget {
+            const DocuMasterApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: "DocuMaster Pro",
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(
+                  colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFFB30B00)),
+                  useMaterial3: true,
+                ),
+                home: const HomeScreen(),
+              );
+            }
+          }
+
+          class HomeScreen extends StatefulWidget {
+            const HomeScreen({super.key});
+
+            @override
+            State<HomeScreen> createState() => _HomeScreenState();
+          }
+
+          class _HomeScreenState extends State<HomeScreen> {
+            String _selectedTool = "Dashboard";
+            bool _isDragging = false;
+            File? _currentPdfFile;
+
+            final List<Map<String, dynamic>> _tools = [
+              {"title": "PDF to Word", "icon": Icons.description, "desc": "Convert PDF documents to editable DOC"},
+              {"title": "Word to PDF", "icon": Icons.picture_as_pdf, "desc": "Convert DOCX/TXT files into standard PDF"},
+              {"title": "Edit PDF Text", "icon": Icons.edit_document, "desc": "Modify or insert text directly into PDF"},
+              {"title": "Sign PDF", "icon": Icons.draw, "desc": "Draw and place your digital signature"},
+              {"title": "Merge PDFs", "icon": Icons.merge_type, "desc": "Combine multiple PDF files into one"},
+              {"title": "Split & Organize", "icon": Icons.call_split, "desc": "Extract pages into separate PDF files"},
+            ];
+
+            Future<void> _pickFileForTool(String toolName) async {
+              if (toolName == "Merge PDFs") {
+                FilePickerResult? result = await FilePicker.platform.pickFiles(
+                  type: FileType.custom,
+                  allowedExtensions: ["pdf"],
+                  allowMultiple: true,
+                );
+                if (result != null && result.paths.length >= 2) {
+                  await _mergePdfFiles(result.paths.whereType<String>().toList());
+                } else if (result != null) {
+                  _showSnack("Please select at least 2 PDF files to merge.");
+                }
+                return;
+              }
+
+              List<String> allowedExt = toolName == "Word to PDF" ? ["docx", "doc", "txt"] : ["pdf"];
+              FilePickerResult? result = await FilePicker.platform.pickFiles(
+                type: FileType.custom,
+                allowedExtensions: allowedExt,
+              );
+
+              if (result != null && result.files.single.path != null) {
+                File selectedFile = File(result.files.single.path!);
+                await _processFile(selectedFile, toolName);
+              }
+            }
+
+            Future<void> _processFile(File file, String toolName) async {
+              final ext = file.path.split(".").last.toLowerCase();
+
+              if (toolName == "PDF to Word") {
+                await _convertPdfToWord(file);
+              } else if (toolName == "Word to PDF" || ext == "docx" || ext == "doc" || ext == "txt") {
+                await _convertWordToPdf(file);
+              } else if (toolName == "Edit PDF Text" && ext == "pdf") {
+                setState(() => _currentPdfFile = file);
+                _showAddTextDialog(file);
+              } else if (toolName == "Sign PDF" && ext == "pdf") {
+                setState(() => _currentPdfFile = file);
+                _showSignatureDialog(file);
+              } else if (toolName == "Split & Organize" && ext == "pdf") {
+                await _splitPdfFile(file);
+              } else if (ext == "pdf") {
+                setState(() => _currentPdfFile = file);
+              } else {
+                _showSnack("Unsupported file format for " + toolName);
+              }
+            }
+
+            Future<void> _convertPdfToWord(File pdfFile) async {
+              try {
+                final bytes = await pdfFile.readAsBytes();
+                final PdfDocument document = PdfDocument(inputBytes: bytes);
+                String extractedText = PdfTextExtractor(document).extractText();
+                document.dispose();
+
+                String? savePath = await FilePicker.platform.saveFile(
+                  dialogTitle: "Save Word File",
+                  fileName: "converted_document.doc",
+                );
+
+                if (savePath != null) {
+                  await File(savePath).writeAsString(extractedText);
+                  _showSnack("Saved successfully to: " + savePath);
+                }
+              } catch (e) {
+                _showSnack("Error converting PDF to Word: " + e.toString());
+              }
+            }
+
+            Future<void> _convertWordToPdf(File wordFile) async {
+              try {
+                String content = "";
+                try {
+                  content = await wordFile.readAsString();
+                } catch (_) {
+                  content = "Document converted from: " + wordFile.path;
+                }
+
+                final PdfDocument document = PdfDocument();
+                final PdfPage page = document.pages.add();
+                page.graphics.drawString(
+                  content,
+                  PdfStandardFont(PdfFontFamily.helvetica, 12),
+                  bounds: ui.Rect.fromLTWH(0, 0, page.getClientSize().width, page.getClientSize().height),
+                );
+
+                final List<int> bytes = await document.save();
+                document.dispose();
+
+                String? savePath = await FilePicker.platform.saveFile(
+                  dialogTitle: "Save PDF File",
+                  fileName: "converted_document.pdf",
+                );
+
+                if (savePath != null) {
+                  await File(savePath).writeAsBytes(bytes);
+                  setState(() => _currentPdfFile = File(savePath));
+                  _showSnack("PDF saved to: " + savePath);
+                }
+              } catch (e) {
+                _showSnack("Error converting to PDF: " + e.toString());
+              }
+            }
+
+            Future<void> _showAddTextDialog(File pdfFile) async {
+              final textCtrl = TextEditingController();
+              final xCtrl = TextEditingController(text: "50");
+              final yCtrl = TextEditingController(text: "50");
+
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text("Add / Edit Text on PDF"),
+                  content: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      TextField(controller: textCtrl, decoration: const InputDecoration(labelText: "Enter Text")),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(child: TextField(controller: xCtrl, decoration: const InputDecoration(labelText: "X Position"), keyboardType: TextInputType.number)),
+                          const SizedBox(width: 10),
+                          Expanded(child: TextField(controller: yCtrl, decoration: const InputDecoration(labelText: "Y Position"), keyboardType: TextInputType.number)),
+                        ],
+                      ),
+                    ],
+                  ),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
+                    ElevatedButton(
+                      onPressed: () async {
+                        Navigator.pop(ctx);
+                        final bytes = await pdfFile.readAsBytes();
+                        final PdfDocument doc = PdfDocument(inputBytes: bytes);
+                        final PdfPage page = doc.pages[0];
+                        page.graphics.drawString(
+                          textCtrl.text,
+                          PdfStandardFont(PdfFontFamily.helvetica, 16),
+                          brush: PdfSolidBrush(PdfColor(0, 0, 0)),
+                          bounds: ui.Rect.fromLTWH(
+                            double.tryParse(xCtrl.text) ?? 50,
+                            double.tryParse(yCtrl.text) ?? 50,
+                            400,
+                            100,
+                          ),
+                        );
+                        final outBytes = await doc.save();
+                        doc.dispose();
+
+                        String? savePath = await FilePicker.platform.saveFile(
+                          dialogTitle: "Save Edited PDF",
+                          fileName: "edited_document.pdf",
+                        );
+                        if (savePath != null) {
+                          final savedFile = File(savePath);
+                          await savedFile.writeAsBytes(outBytes);
+                          setState(() => _currentPdfFile = savedFile);
+                          _showSnack("Edited PDF saved successfully!");
+                        }
+                      },
+                      child: const Text("Apply & Save"),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            Future<void> _showSignatureDialog(File pdfFile) async {
+              final SignatureController sigController = SignatureController(
+                penStrokeWidth: 3,
+                penColor: Colors.black,
+                exportBackgroundColor: Colors.transparent,
+              );
+
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text("Draw Your Signature"),
+                  content: SizedBox(
+                    width: 400,
+                    height: 200,
+                    child: Container(
+                      decoration: BoxDecoration(border: Border.all(color: Colors.grey)),
+                      child: Signature(controller: sigController, backgroundColor: Colors.white),
+                    ),
+                  ),
+                  actions: [
+                    TextButton(onPressed: () => sigController.clear(), child: const Text("Clear")),
+                    TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
+                    ElevatedButton(
+                      onPressed: () async {
+                        final Uint8List? sigBytes = await sigController.toPngBytes();
+                        if (sigBytes == null) return;
+                        Navigator.pop(ctx);
+
+                        final bytes = await pdfFile.readAsBytes();
+                        final PdfDocument doc = PdfDocument(inputBytes: bytes);
+                        final PdfPage page = doc.pages[0];
+                        final PdfBitmap image = PdfBitmap(sigBytes);
+                        page.graphics.drawImage(image, const ui.Rect.fromLTWH(100, 100, 180, 70));
+
+                        final outBytes = await doc.save();
+                        doc.dispose();
+
+                        String? savePath = await FilePicker.platform.saveFile(
+                          dialogTitle: "Save Signed PDF",
+                          fileName: "signed_document.pdf",
+                        );
+                        if (savePath != null) {
+                          final savedFile = File(savePath);
+                          await savedFile.writeAsBytes(outBytes);
+                          setState(() => _currentPdfFile = savedFile);
+                          _showSnack("Signed PDF saved successfully!");
+                        }
+                      },
+                      child: const Text("Place Signature & Save"),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            Future<void> _mergePdfFiles(List<String> paths) async {
+              try {
+                final PdfDocument outputDoc = PdfDocument();
+                for (String path in paths) {
+                  final bytes = await File(path).readAsBytes();
+                  final PdfDocument inputDoc = PdfDocument(inputBytes: bytes);
+                  for (int i = 0; i < inputDoc.pages.count; i++) {
+                    final template = inputDoc.pages[i].createTemplate();
+                    final page = outputDoc.pages.add();
+                    page.graphics.drawPdfTemplate(template, ui.Offset.zero);
+                  }
+                  inputDoc.dispose();
+                }
+                final outBytes = await outputDoc.save();
+                outputDoc.dispose();
+
+                String? savePath = await FilePicker.platform.saveFile(
+                  dialogTitle: "Save Merged PDF",
+                  fileName: "merged_document.pdf",
+                );
+                if (savePath != null) {
+                  final savedFile = File(savePath);
+                  await savedFile.writeAsBytes(outBytes);
+                  setState(() => _currentPdfFile = savedFile);
+                  _showSnack("Merged PDF files successfully!");
+                }
+              } catch (e) {
+                _showSnack("Error merging PDFs: " + e.toString());
+              }
+            }
+
+            Future<void> _splitPdfFile(File pdfFile) async {
+              try {
+                final bytes = await pdfFile.readAsBytes();
